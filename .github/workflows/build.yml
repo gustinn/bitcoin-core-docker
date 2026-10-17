@@ -11,6 +11,8 @@ on:
     branches:
       - master
     paths:
+      - '.github/workflows/build.yml'
+      - 'scripts/ci.py'
       - '*/Dockerfile'
       - '*/docker-entrypoint.sh'
       - '*/alpine/Dockerfile'
@@ -18,6 +20,9 @@ on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: read
 
 jobs:
   discover:
@@ -31,26 +36,21 @@ jobs:
 
       - name: Discover versions and set matrix
         id: matrix
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          # Skip branch builds if this commit has a tag (tag build will handle it)
-          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
-            if git describe --exact-match --tags HEAD 2>/dev/null; then
-              echo "Commit has a tag, skipping branch build"
-              echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
-              echo "push=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+          VERSION_FLAG=()
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            VERSION_FLAG=(--version "$REQUESTED_VERSION")
           fi
-
-          VERSION_FLAG=""
-          if [[ -n "${{ inputs.version }}" ]]; then
-            VERSION_FLAG="--version ${{ inputs.version }}"
-          fi
-          echo "matrix=$(python scripts/ci.py matrix --ref $GITHUB_REF $VERSION_FLAG)" >> $GITHUB_OUTPUT
-          echo "push=$(python scripts/ci.py should-push --ref $GITHUB_REF $VERSION_FLAG)" >> $GITHUB_OUTPUT
+          echo "matrix=$(python scripts/ci.py matrix --ref "$GITHUB_REF" "${VERSION_FLAG[@]}")" >> "$GITHUB_OUTPUT"
+          echo "push=$(python scripts/ci.py should-push --ref "$GITHUB_REF" "${VERSION_FLAG[@]}")" >> "$GITHUB_OUTPUT"
 
   build:
     needs: discover
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
@@ -81,19 +81,26 @@ jobs:
             PLATFORMS="linux/amd64,linux/arm64,linux/arm/v7"
           fi
 
-          TAGS=$(python scripts/ci.py tags --version "${{ matrix.version }}" $ALPINE_FLAG)
+          # Reuse upstream version aliases, publishing only to this fork's GHCR.
+          SOURCE_TAGS=$(python scripts/ci.py tags --version "${{ matrix.version }}" $ALPINE_FLAG)
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAGS=()
+          for TAG in $SOURCE_TAGS; do
+            TAGS+=("$IMAGE:${TAG##*:}")
+          done
 
           echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
           echo "build_path=$BUILD_PATH" >> $GITHUB_OUTPUT
           echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
-          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          echo "tags=${TAGS[*]}" >> $GITHUB_OUTPUT
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         if: ${{ needs.discover.outputs.push == 'true' }}
         uses: docker/login-action@v4
         with:
-          username: bitcoin
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Docker image
         run: |
@@ -109,6 +116,7 @@ jobs:
             --platform ${{ steps.prepare.outputs.platforms }} \
             --output "type=image,push=${{ needs.discover.outputs.push }}" \
             --progress=plain \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --build-arg "BUILD_DATE=${{ steps.prepare.outputs.build_date }}" \
             --build-arg "VCS_REF=${GITHUB_SHA::8}" \
             $(printf "%s" "${TAGS[@]/#/ --tag }") \
